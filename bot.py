@@ -147,14 +147,15 @@ async def cmd_stats(update: Update, _):
     with closing(db()) as conn:
         rows = conn.execute(
             """
-            SELECT m.user_id, COALESCE(m.first_name,'') AS first_name,
-                   COALESCE(m.username,'') AS username,
-                   COALESCE(s.score,0) AS score
+            SELECT m.user_id,
+                   COALESCE(m.first_name,'') AS first_name,
+                   COALESCE(m.username,'')   AS username,
+                   COALESCE(s.score,0)       AS score
             FROM members m
             LEFT JOIN scores s
-              ON s.chat_id=m.chat_id AND s.user_id=m.user_id
-            WHERE m.chat_id=?
-              AND m.is_bot=0
+              ON s.chat_id = m.chat_id AND s.user_id = m.user_id
+            WHERE m.chat_id = ?
+              AND m.is_bot = 0
             ORDER BY score DESC, first_name ASC
             """,
             (chat.id,),
@@ -164,12 +165,17 @@ async def cmd_stats(update: Update, _):
         await update.effective_message.reply_text("No members tracked yet.")
         return
 
+    # Determine top score to mark leader(s)
+    top_score = rows[0]["score"] if rows else 0
+
     lines = ["*Gryaz stats:*"]
     for r in rows:
         label = f"[{r['first_name']}](tg://user?id={r['user_id']})"
         if r["username"]:
             label += f" (@{r['username']})"
-        lines.append(f"{label}: *{r['score']}*")
+
+        pill = " 💊" if r["score"] == top_score and top_score > 0 else ""
+        lines.append(f"{label}: *{r['score']}*{pill}")
 
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
