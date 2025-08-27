@@ -3,6 +3,7 @@ import os
 import math
 import sqlite3
 import logging
+import time
 from contextlib import closing
 from typing import Optional
 
@@ -28,7 +29,7 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-DB_PATH = os.environ.get("DB_PATH", "gryaz.db")
+DB_PATH = "gryaz.db"
 
 # ---------- DB helpers ----------
 def db():
@@ -64,7 +65,8 @@ def init_db():
               target_user_id INTEGER NOT NULL,
               plus_count INTEGER NOT NULL DEFAULT 0,
               minus_count INTEGER NOT NULL DEFAULT 0,
-              closed INTEGER NOT NULL DEFAULT 0
+              closed INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
 
             CREATE TABLE IF NOT EXISTS poll_votes(
@@ -131,6 +133,7 @@ async def cmd_start(update: Update, _):
         "• Reply to someone with /gryaz to start a vote (+ / –)\n"
         "• When + votes reach half of non-bot members, vote closes and the target gets +1\n"
         "• If – votes reach half, the poll is cancelled\n"
+        "• A person cannot be targeted again until 5 minutes have passed\n"
         "• /stats — show scores\n\n"
         "_Tip: Disable privacy mode in BotFather and make me admin for best results._"
     )
@@ -187,15 +190,7 @@ async def cmd_gryaz(update: Update, context):
             target = None
 
     if not target:
-        msg_text = update.effective_message.text or ""
-        if "@" in msg_text:
-            await update.effective_message.reply_text(
-                "I don’t know that @username yet — they need to send at least one message in this group first."
-            )
-        else:
-            await update.effective_message.reply_text(
-                "Select a target: reply to their message with /gryaz or use /gryaz @username (after they’ve spoken at least once)."
-            )
+        await update.effective_message.reply_text("Select a target with /gryaz (reply or @username).")
         return
 
     if target.is_bot:
@@ -204,10 +199,26 @@ async def cmd_gryaz(update: Update, context):
 
     upsert_member(chat, target)
 
+    # --- 5 minute threshold check ---
+    now = int(time.time())
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT created_at FROM polls WHERE chat_id=? AND target_user_id=? ORDER BY created_at DESC LIMIT 1",
+            (chat.id, target.id),
+        ).fetchone()
+        if row and now - row["created_at"] < 300:
+            wait_min = (300 - (now - row["created_at"])) // 60
+            wait_sec = (300 - (now - row["created_at"])) % 60
+            await update.effective_message.reply_text(
+                f"⏳ A vote for {target.first_name} happened recently. Try again in {wait_min}m {wait_sec}s."
+            )
+            return
+
+    # --- create poll ---
     with closing(db()) as conn, conn:
         cur = conn.execute(
-            "INSERT INTO polls(chat_id, message_id, target_user_id, plus_count, minus_count, closed) VALUES(?,?,?,?,?,?)",
-            (chat.id, 0, target.id, 0, 0, 0),
+            "INSERT INTO polls(chat_id, message_id, target_user_id, plus_count, minus_count, closed, created_at) VALUES(?,?,?,?,?,?,?)",
+            (chat.id, 0, target.id, 0, 0, 0, now),
         )
         poll_id = cur.lastrowid
 
@@ -253,7 +264,7 @@ async def on_vote(update: Update, context):
         await q.edit_message_reply_markup(reply_markup=None)
         return
 
-    # Vote only once
+    # One vote only
     try:
         with closing(db()) as conn, conn:
             conn.execute(
@@ -264,7 +275,6 @@ async def on_vote(update: Update, context):
         await q.answer("You already voted!", show_alert=True)
         return
 
-    # Recount
     with closing(db()) as conn:
         row = conn.execute(
             "SELECT SUM(vote='plus') AS plus_c, SUM(vote='minus') AS minus_c FROM poll_votes WHERE poll_id=?",
@@ -280,7 +290,6 @@ async def on_vote(update: Update, context):
 
     threshold = max(1, math.ceil(non_bot_member_count(chat.id) / 2))
 
-    # YES wins
     if plus_c >= threshold:
         with closing(db()) as conn, conn:
             conn.execute("UPDATE polls SET closed=1 WHERE id=?", (poll_id,))
@@ -309,7 +318,6 @@ async def on_vote(update: Update, context):
             parse_mode=ParseMode.MARKDOWN,
         )
 
-    # NO wins
     elif minus_c >= threshold:
         with closing(db()) as conn, conn:
             conn.execute("UPDATE polls SET closed=1 WHERE id=?", (poll_id,))
@@ -319,8 +327,6 @@ async def on_vote(update: Update, context):
             f"(👍 {plus_c} / 👎 {minus_c}, needed {threshold})",
             parse_mode=ParseMode.MARKDOWN,
         )
-
-    # Still in progress
     else:
         await q.edit_message_text(
             f"*Vote in progress...*\n👍 {plus_c} / 👎 {minus_c} (need {threshold})",
