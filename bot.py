@@ -32,15 +32,15 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "gryaz.db")
-TARGET_COOLDOWN = int(os.environ.get("TARGET_COOLDOWN", "300"))  # 5 min default
-VOTE_TIMEOUT = int(os.environ.get("VOTE_TIMEOUT", "600"))        # 10 min default, 0 = disabled
+TARGET_COOLDOWN = int(os.environ.get("TARGET_COOLDOWN", "300"))  # seconds; default 5m
+VOTE_TIMEOUT = int(os.environ.get("VOTE_TIMEOUT", "600"))        # seconds; default 10m, 0=disabled
 INIT_SCORES_RAW = os.environ.get("INIT_SCORES", "").strip()
 
 def parse_init_scores(raw: str):
     mapping = {}
     if not raw:
         return mapping
-    # Try JSON first
+    # JSON first
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
@@ -207,22 +207,42 @@ async def start_vote_for_target(update: Update, context, chat: Chat, target_user
 
     now = int(time.time())
     with closing(db()) as conn:
-        # Block if there's an open poll already
-        open_poll = conn.execute(
-            "SELECT 1 FROM polls WHERE chat_id=? AND target_user_id=? AND closed=0 LIMIT 1",
+        # Check if there's an open poll
+        open_row = conn.execute(
+            "SELECT id, created_at, message_id FROM polls WHERE chat_id=? AND target_user_id=? AND closed=0 LIMIT 1",
             (chat.id, target_user.id),
         ).fetchone()
-        if open_poll:
-            await update.effective_message.reply_text(
-                f"🗳️ A vote for {target_user.first_name} is already in progress."
+
+    # If an open poll exists but is older than timeout, expire it *now* so it won't block
+    if open_row and VOTE_TIMEOUT > 0 and (now - int(open_row["created_at"])) >= VOTE_TIMEOUT:
+        with closing(db()) as conn, conn:
+            conn.execute("UPDATE polls SET closed=1, expired=1 WHERE id=?", (open_row["id"],))
+        # Try to edit the old poll message (best-effort)
+        try:
+            await context.bot.edit_message_text(
+                "⌛ *Vote expired*",
+                chat_id=chat.id,
+                message_id=open_row["message_id"],
+                parse_mode=ParseMode.MARKDOWN,
             )
-            return
+        except Exception:
+            pass
+        open_row = None  # consider no open poll now
+
+    # If still open (within timeout), block
+    if open_row:
+        await update.effective_message.reply_text(
+            f"🗳️ A vote for {target_user.first_name} is already in progress."
+        )
+        return
+
+    # Cooldown check: only if the last poll was NOT expired
+    with closing(db()) as conn:
         last = conn.execute(
             "SELECT created_at, expired FROM polls WHERE chat_id=? AND target_user_id=? ORDER BY created_at DESC LIMIT 1",
             (chat.id, target_user.id),
         ).fetchone()
 
-    # Cooldown only if last poll was not expired
     if last and not last["expired"]:
         elapsed = now - int(last["created_at"])
         if elapsed < TARGET_COOLDOWN:
@@ -232,6 +252,7 @@ async def start_vote_for_target(update: Update, context, chat: Chat, target_user
             )
             return
 
+    # Create new poll
     with closing(db()) as conn, conn:
         cur = conn.execute(
             "INSERT INTO polls(chat_id, message_id, target_user_id, plus_count, minus_count, closed, expired, created_at) "
@@ -420,7 +441,6 @@ async def expire_polls(context):
     if VOTE_TIMEOUT <= 0:
         return
     now = int(time.time())
-    # Select polls that are open and past timeout
     with closing(db()) as conn:
         rows = conn.execute(
             "SELECT id, chat_id, message_id FROM polls WHERE closed=0 AND (? - created_at) >= ?",
@@ -432,7 +452,6 @@ async def expire_polls(context):
             "UPDATE polls SET closed=1, expired=1 WHERE closed=0 AND (? - created_at) >= ?",
             (now, VOTE_TIMEOUT),
         )
-    # Try to edit each expired poll message
     for r in rows:
         try:
             await context.bot.edit_message_text(
@@ -442,7 +461,6 @@ async def expire_polls(context):
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
-            # message may be deleted or too old to edit; ignore
             pass
 
 # ---------- Main ----------
@@ -469,17 +487,18 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & (~filters.StatusUpdate.ALL), on_message))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
-    # Schedule background expiration job (runs even with no interactions)
-    if VOTE_TIMEOUT > 0:
-        # Run roughly every half-timeout, clamped between 15s and 300s
+    # Auto-expire in background (requires PTB job-queue extra)
+    if VOTE_TIMEOUT > 0 and app.job_queue:
         interval = max(15, min(300, (VOTE_TIMEOUT // 2) or 60))
         app.job_queue.run_repeating(expire_polls, interval=interval, first=interval)
         log.info("Auto-expire enabled: timeout=%ss, check interval=%ss", VOTE_TIMEOUT, interval)
-    else:
-        log.info("Auto-expire disabled")
+    elif VOTE_TIMEOUT > 0:
+        log.warning("VOTE_TIMEOUT set but no JobQueue available. Install PTB with job-queue extra.")
 
-    log.info("Starting bot (DB_PATH=%s, TARGET_COOLDOWN=%s, VOTE_TIMEOUT=%s, INIT_SCORES=%s)",
-             DB_PATH, TARGET_COOLDOWN, VOTE_TIMEOUT, "set" if INIT_SCORES_MAP else "unset")
+    log.info(
+        "Starting bot (DB_PATH=%s, TARGET_COOLDOWN=%s, VOTE_TIMEOUT=%s, INIT_SCORES=%s)",
+        DB_PATH, TARGET_COOLDOWN, VOTE_TIMEOUT, "set" if INIT_SCORES_MAP else "unset"
+    )
     app.run_polling()
 
 if __name__ == "__main__":
