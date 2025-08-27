@@ -32,65 +32,41 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "gryaz.db")
-COOLDOWN_SECONDS = 300  # 5 minutes between targeting same person in the same chat
-VOTE_TIMEOUT = int(os.environ.get("VOTE_TIMEOUT", "0"))  # 0 = disabled
 
-# INIT_SCORES examples:
-# JSON (recommended):
-#   {"dixxi": 3, "@alice": 5, "Bob": 2}
-# or CSV:
-#   dixxi:3, @alice:5, Bob:2
+# Threshold before same target can be voted again
+TARGET_COOLDOWN = int(os.environ.get("TARGET_COOLDOWN", "300"))  # default 5 min
+# Poll expiration
+VOTE_TIMEOUT = int(os.environ.get("VOTE_TIMEOUT", "600"))  # default 10 min, 0=disabled
+
+# Optional seeding (transfer scores across servers)
 INIT_SCORES_RAW = os.environ.get("INIT_SCORES", "").strip()
 
+
 def parse_init_scores(raw: str):
-    """
-    Parse INIT_SCORES into a dict: key(lowercased 'username' or 'first name') -> int points
-    Supports JSON (object or list of {name|username, points}) or CSV "key:points, key:points"
-    """
     mapping = {}
     if not raw:
         return mapping
-    # Try JSON
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
             for k, v in data.items():
-                if not isinstance(v, int):
-                    continue
-                key = str(k).lstrip("@").strip().lower()
-                if key:
-                    mapping[key] = v
-            return mapping
-        if isinstance(data, list):
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                pts = item.get("points")
-                if not isinstance(pts, int):
-                    continue
-                key = (item.get("username") or item.get("name") or "").lstrip("@").strip().lower()
-                if key:
-                    mapping[key] = pts
+                if isinstance(v, int):
+                    mapping[str(k).lstrip("@").strip().lower()] = v
             return mapping
     except Exception:
         pass
-    # Fallback CSV
-    try:
-        pairs = [p for p in re.split(r"\s*,\s*", raw) if p]
-        for pair in pairs:
-            if ":" not in pair:
-                continue
-            k, v = pair.split(":", 1)
-            k = k.lstrip("@").strip().lower()
-            try:
-                points = int(v.strip())
-            except Exception:
-                continue
-            if k:
-                mapping[k] = points
-    except Exception:
-        pass
+    # CSV fallback
+    for part in re.split(r"\s*,\s*", raw):
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        try:
+            points = int(v.strip())
+        except ValueError:
+            continue
+        mapping[k.lstrip("@").strip().lower()] = points
     return mapping
+
 
 INIT_SCORES_MAP = parse_init_scores(INIT_SCORES_RAW)
 if INIT_SCORES_MAP:
@@ -102,6 +78,7 @@ def db():
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     with closing(db()) as conn, conn:
@@ -131,6 +108,7 @@ def init_db():
               plus_count     INTEGER NOT NULL DEFAULT 0,
               minus_count    INTEGER NOT NULL DEFAULT 0,
               closed         INTEGER NOT NULL DEFAULT 0,
+              expired        INTEGER NOT NULL DEFAULT 0,
               created_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
 
@@ -143,6 +121,7 @@ def init_db():
             );
             """
         )
+
 
 def upsert_member(chat: Chat, user) -> None:
     with closing(db()) as conn, conn:
@@ -158,6 +137,7 @@ def upsert_member(chat: Chat, user) -> None:
             (chat.id, user.id, user.username or "", user.first_name or "", 1 if user.is_bot else 0),
         )
 
+
 def non_bot_member_count(chat_id: int) -> int:
     with closing(db()) as conn:
         row = conn.execute(
@@ -166,35 +146,27 @@ def non_bot_member_count(chat_id: int) -> int:
         ).fetchone()
         return int(row["c"] or 0)
 
+
 def maybe_apply_init_score(chat_id: int, user) -> None:
-    """If INIT_SCORES is set and this user's username/first_name matches, set their score (once)."""
     if not INIT_SCORES_MAP:
         return
     uname = (user.username or "").lstrip("@").strip().lower()
     fname = (user.first_name or "").strip().lower()
-
-    key = uname or fname
-    # Try username first, then first name
-    candidates = [uname, fname] if uname != fname else [key]
-    for cand in candidates:
-        if not cand:
-            continue
-        if cand in INIT_SCORES_MAP:
-            points = INIT_SCORES_MAP[cand]
+    for key in {uname, fname}:
+        if key and key in INIT_SCORES_MAP:
+            pts = INIT_SCORES_MAP[key]
             with closing(db()) as conn, conn:
-                # Only set if there is no score row yet, or overwrite unconditionally?
-                # We'll set unconditionally to ensure migration wins.
                 conn.execute(
                     """
                     INSERT INTO scores(chat_id, user_id, score)
                     VALUES(?,?,?)
                     ON CONFLICT(chat_id, user_id) DO UPDATE SET score=excluded.score
                     """,
-                    (chat_id, user.id, points),
+                    (chat_id, user.id, pts),
                 )
-            log.info("Seeded score for user_id=%s in chat_id=%s to %s via INIT_SCORES key=%s",
-                     user.id, chat_id, points, cand)
+            log.info("Seeded score for %s in chat %s to %s", user.id, chat_id, pts)
             break
+
 
 # ---------- Utils ----------
 async def ensure_group(update: Update) -> Optional[Chat]:
@@ -204,8 +176,8 @@ async def ensure_group(update: Update) -> Optional[Chat]:
         return None
     return update.effective_chat
 
+
 def resolve_target_user(update: Update):
-    """Return a telegram.User (via reply) or an int user_id (from cached @username); else None."""
     msg = update.effective_message
     if msg and msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user
@@ -222,14 +194,14 @@ def resolve_target_user(update: Update):
                         return row["user_id"]
     return None
 
+
 def format_time_left(seconds: int) -> str:
     m, s = divmod(seconds, 60)
     return f"{m}m {s}s" if m else f"{s}s"
 
-# ---------- Shared: start a vote for a specific target ----------
+
+# ---------- Core vote start ----------
 async def start_vote_for_target(update: Update, context, chat: Chat, target_user):
-    """Starts a gryaz vote for target_user. Enforces cooldown and avoids duplicates."""
-    # Track issuer & target, and maybe seed score
     if update.effective_user:
         upsert_member(chat, update.effective_user)
         maybe_apply_init_score(chat.id, update.effective_user)
@@ -238,8 +210,8 @@ async def start_vote_for_target(update: Update, context, chat: Chat, target_user
 
     now = int(time.time())
 
-    # Prevent duplicate open poll for same target
     with closing(db()) as conn:
+        # block if open poll exists
         open_poll = conn.execute(
             "SELECT 1 FROM polls WHERE chat_id=? AND target_user_id=? AND closed=0 LIMIT 1",
             (chat.id, target_user.id),
@@ -249,33 +221,30 @@ async def start_vote_for_target(update: Update, context, chat: Chat, target_user
                 f"🗳️ A vote for {target_user.first_name} is already in progress."
             )
             return
-
         last = conn.execute(
-            "SELECT created_at FROM polls WHERE chat_id=? AND target_user_id=? ORDER BY created_at DESC LIMIT 1",
+            "SELECT created_at, expired FROM polls WHERE chat_id=? AND target_user_id=? ORDER BY created_at DESC LIMIT 1",
             (chat.id, target_user.id),
         ).fetchone()
 
-    if last:
+    if last and not last["expired"]:
         elapsed = now - int(last["created_at"])
-        if elapsed < COOLDOWN_SECONDS:
-            wait = COOLDOWN_SECONDS - elapsed
+        if elapsed < TARGET_COOLDOWN:
             await update.effective_message.reply_text(
-                f"⏳ A vote for {target_user.first_name} happened recently. Try again in {format_time_left(wait)}."
+                f"⏳ A vote for {target_user.first_name} happened recently. Try again in {format_time_left(TARGET_COOLDOWN - elapsed)}."
             )
             return
 
-    # Create poll
     with closing(db()) as conn, conn:
         cur = conn.execute(
-            "INSERT INTO polls(chat_id, message_id, target_user_id, plus_count, minus_count, closed, created_at) VALUES(?,?,?,?,?,?,?)",
-            (chat.id, 0, target_user.id, 0, 0, 0, now),
+            "INSERT INTO polls(chat_id, message_id, target_user_id, plus_count, minus_count, closed, expired, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (chat.id, 0, target_user.id, 0, 0, 0, 0, now),
         )
         poll_id = cur.lastrowid
 
     kb = InlineKeyboardMarkup(
         [[
-            InlineKeyboardButton(text="👍 +", callback_data=f"vote:{poll_id}:plus"),
-            InlineKeyboardButton(text="👎 –", callback_data=f"vote:{poll_id}:minus"),
+            InlineKeyboardButton("👍 +", callback_data=f"vote:{poll_id}:plus"),
+            InlineKeyboardButton("👎 –", callback_data=f"vote:{poll_id}:minus"),
         ]]
     )
     threshold = max(1, math.ceil(non_bot_member_count(chat.id) / 2))
@@ -285,67 +254,55 @@ async def start_vote_for_target(update: Update, context, chat: Chat, target_user
         reply_markup=kb,
         parse_mode=ParseMode.MARKDOWN,
     )
-
     with closing(db()) as conn, conn:
         conn.execute("UPDATE polls SET message_id=? WHERE id=?", (m.message_id, poll_id))
+
 
 # ---------- Handlers ----------
 async def cmd_start(update: Update, _):
     text = (
         "Hi! I’m a *gryaz* counter.\n\n"
-        "• Reply to someone with /gryaz (or reply with 🐗/💊) to start a vote (+ / –)\n"
-        "• + votes ≥ half of non-bot members → +1 to target\n"
-        "• – votes ≥ half → poll cancelled\n"
-        f"• Each user can vote only once per poll; target cooldown: {COOLDOWN_SECONDS//60} min\n"
-        f"• Vote timeout: {'off' if VOTE_TIMEOUT <= 0 else str(VOTE_TIMEOUT//60)+' min'}\n"
-        "• /stats — show scores (leaders get 💊)\n\n"
-        "_Tip: Disable privacy mode in BotFather and make me admin for best results._"
+        "• Reply with /gryaz or 🐗/💊 to start a vote\n"
+        f"• Target cooldown: {TARGET_COOLDOWN//60}m\n"
+        f"• Vote timeout: {'disabled' if VOTE_TIMEOUT<=0 else str(VOTE_TIMEOUT//60)+'m'}\n"
+        "• /stats shows leaderboard (leaders 💊)"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
 
 async def cmd_stats(update: Update, _):
     chat = await ensure_group(update)
     if not chat:
         return
-
     with closing(db()) as conn:
         rows = conn.execute(
-            """
-            SELECT m.user_id,
-                   COALESCE(m.first_name,'') AS first_name,
-                   COALESCE(m.username,'')   AS username,
-                   COALESCE(s.score,0)       AS score
-            FROM members m
-            LEFT JOIN scores s
-              ON s.chat_id = m.chat_id AND s.user_id = m.user_id
-            WHERE m.chat_id = ?
-              AND m.is_bot = 0
-            ORDER BY score DESC, first_name ASC
-            """,
+            """SELECT m.user_id, COALESCE(m.first_name,'') as first_name,
+                      COALESCE(m.username,'') as username,
+                      COALESCE(s.score,0) as score
+               FROM members m
+               LEFT JOIN scores s ON s.chat_id=m.chat_id AND s.user_id=m.user_id
+              WHERE m.chat_id=? AND m.is_bot=0
+              ORDER BY score DESC, first_name ASC""",
             (chat.id,),
         ).fetchall()
-
     if not rows:
         await update.effective_message.reply_text("No members tracked yet.")
         return
-
-    top_score = rows[0]["score"] if rows else 0
-
+    top = rows[0]["score"]
     lines = ["*Gryaz stats:*"]
     for r in rows:
-        label = f"[{r['first_name']}](tg://user?id={r['user_id']})"
+        name = f"[{r['first_name']}](tg://user?id={r['user_id']})"
         if r["username"]:
-            label += f" (@{r['username']})"
-        pill = " 💊" if r["score"] == top_score and top_score > 0 else ""
-        lines.append(f"{label}: *{r['score']}*{pill}")
-
+            name += f" (@{r['username']})"
+        pill = " 💊" if r["score"] == top and top > 0 else ""
+        lines.append(f"{name}: *{r['score']}*{pill}")
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
 
 async def cmd_gryaz(update: Update, context):
     chat = await ensure_group(update)
     if not chat:
         return
-
     target = resolve_target_user(update)
     if isinstance(target, int):
         try:
@@ -353,204 +310,110 @@ async def cmd_gryaz(update: Update, context):
             target = cm.user
         except Exception:
             target = None
-
-    if not target:
-        await update.effective_message.reply_text(
-            "Select a target: reply to their message with /gryaz or use /gryaz @username (after they’ve spoken at least once)."
-        )
+    if not target or target.is_bot:
         return
-
-    if target.is_bot:
-        await update.effective_message.reply_text("You can’t start a gryaz vote on a bot.")
-        return
-
     await start_vote_for_target(update, context, chat, target)
 
+
 async def on_emoji_trigger(update: Update, context):
-    """Reply with 🐗 or 💊 to any message to start a vote for that message's sender."""
     chat = await ensure_group(update)
     if not chat:
         return
     msg = update.effective_message
     if not (msg and msg.reply_to_message and msg.text):
         return
-
     target_user = msg.reply_to_message.from_user
     if not target_user or target_user.is_bot:
         return
-
     await start_vote_for_target(update, context, chat, target_user)
+
 
 async def on_vote(update: Update, context):
     q = update.callback_query
-    if not q:
-        return
     await q.answer()
-    data = q.data or ""
     try:
-        _, poll_id_str, vote = data.split(":")
+        _, poll_id_str, vote = q.data.split(":")
         poll_id = int(poll_id_str)
-        assert vote in ("plus", "minus")
     except Exception:
         return
-
-    chat = q.message.chat
-    voter = q.from_user
-    upsert_member(chat, voter)
-    maybe_apply_init_score(chat.id, voter)
-
     with closing(db()) as conn:
-        poll = conn.execute(
-            "SELECT * FROM polls WHERE id=? AND chat_id=?", (poll_id, chat.id)
-        ).fetchone()
-
+        poll = conn.execute("SELECT * FROM polls WHERE id=?", (poll_id,)).fetchone()
     if not poll or poll["closed"]:
-        await q.edit_message_reply_markup(reply_markup=None)
         return
-
-    # Timeout check
     now = int(time.time())
+    # Expire if timed out
     if VOTE_TIMEOUT > 0 and now - int(poll["created_at"]) >= VOTE_TIMEOUT:
         with closing(db()) as conn, conn:
-            conn.execute("UPDATE polls SET closed=1 WHERE id=?", (poll_id,))
-        await q.edit_message_text(
-            f"⌛ *Vote expired* (no decision in {VOTE_TIMEOUT//60} minutes).",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+            conn.execute("UPDATE polls SET closed=1, expired=1 WHERE id=?", (poll_id,))
+        await q.edit_message_text("⌛ *Vote expired*", parse_mode=ParseMode.MARKDOWN)
         return
-
-    # One vote only
+    # Insert vote
     try:
         with closing(db()) as conn, conn:
-            conn.execute(
-                "INSERT INTO poll_votes(poll_id, voter_user_id, vote) VALUES(?,?,?)",
-                (poll_id, voter.id, vote),
-            )
+            conn.execute("INSERT INTO poll_votes VALUES(?,?,?)", (poll_id, q.from_user.id, vote))
     except sqlite3.IntegrityError:
         await q.answer("You already voted!", show_alert=True)
         return
-
-    # Recount
+    # Count
     with closing(db()) as conn:
         row = conn.execute(
-            "SELECT SUM(vote='plus') AS plus_c, SUM(vote='minus') AS minus_c FROM poll_votes WHERE poll_id=?",
+            "SELECT SUM(vote='plus'), SUM(vote='minus') FROM poll_votes WHERE poll_id=?",
             (poll_id,),
         ).fetchone()
-        plus_c = int(row["plus_c"] or 0)
-        minus_c = int(row["minus_c"] or 0)
-        conn.execute(
-            "UPDATE polls SET plus_count=?, minus_count=? WHERE id=?",
-            (plus_c, minus_c, poll_id),
-        )
-
-    threshold = max(1, math.ceil(non_bot_member_count(chat.id) / 2))
-
-    # YES wins
-    if plus_c >= threshold:
+        plus, minus = int(row[0] or 0), int(row[1] or 0)
+        conn.execute("UPDATE polls SET plus_count=?, minus_count=? WHERE id=?", (plus, minus, poll_id))
+    threshold = max(1, math.ceil(non_bot_member_count(q.message.chat.id) / 2))
+    if plus >= threshold:
         with closing(db()) as conn, conn:
             conn.execute("UPDATE polls SET closed=1 WHERE id=?", (poll_id,))
-            target_user_id = poll["target_user_id"]
             conn.execute(
-                """
-                INSERT INTO scores(chat_id, user_id, score)
-                VALUES(?,?,1)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET score = score + 1
-                """,
-                (chat.id, target_user_id),
+                "INSERT INTO scores VALUES(?,?,1) "
+                "ON CONFLICT(chat_id,user_id) DO UPDATE SET score=score+1",
+                (q.message.chat.id, poll["target_user_id"]),
             )
-
-        try:
-            cm = await context.bot.get_chat_member(chat.id, poll["target_user_id"])
-            target_name = cm.user.first_name
-            target_id = cm.user.id
-        except Exception:
-            target_name = "user"
-            target_id = poll["target_user_id"]
-
-        await q.edit_message_text(
-            f"✅ *Gryaz vote passed* for [{target_name}](tg://user?id={target_id}). "
-            f"(👍 {plus_c} / 👎 {minus_c}, needed {threshold})\n"
-            f"Score updated: +1.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
-    # NO wins
-    elif minus_c >= threshold:
+        await q.edit_message_text(f"✅ Vote passed (👍{plus}/👎{minus})", parse_mode=ParseMode.MARKDOWN)
+    elif minus >= threshold:
         with closing(db()) as conn, conn:
             conn.execute("UPDATE polls SET closed=1 WHERE id=?", (poll_id,))
-        await q.edit_message_text(
-            f"❌ *Gryaz vote cancelled*.\n"
-            f"(👍 {plus_c} / 👎 {minus_c}, needed {threshold})",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
-    # Still in progress
+        await q.edit_message_text(f"❌ Vote cancelled (👍{plus}/👎{minus})", parse_mode=ParseMode.MARKDOWN)
     else:
         await q.edit_message_text(
-            f"*Vote in progress...*\n👍 {plus_c} / 👎 {minus_c} (need {threshold})",
+            f"*Vote in progress...* 👍{plus}/👎{minus} (need {threshold})",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(
-                [[
-                    InlineKeyboardButton(text="👍 +", callback_data=f"vote:{poll_id}:plus"),
-                    InlineKeyboardButton(text="👎 –", callback_data=f"vote:{poll_id}:minus"),
-                ]]
-            ),
+            reply_markup=q.message.reply_markup,
         )
 
+
 async def on_message(update: Update, _):
-    """Track active chat members from any non-status message and apply seeding if configured."""
-    if not update.effective_chat or update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        return
     if update.effective_user:
         upsert_member(update.effective_chat, update.effective_user)
         maybe_apply_init_score(update.effective_chat.id, update.effective_user)
-    if update.effective_message and update.effective_message.reply_to_message and update.effective_message.reply_to_message.from_user:
-        upsert_member(update.effective_chat, update.effective_message.reply_to_message.from_user)
-        maybe_apply_init_score(update.effective_chat.id, update.effective_message.reply_to_message.from_user)
+
 
 async def on_chat_member(update: Update, _):
-    """Track joins/leaves via chat member updates and apply seeding if configured."""
-    cmu: ChatMemberUpdated = update.chat_member
-    chat = cmu.chat
-    user = cmu.new_chat_member.user
+    chat = update.chat_member.chat
+    user = update.chat_member.new_chat_member.user
     upsert_member(chat, user)
     maybe_apply_init_score(chat.id, user)
+
 
 # ---------- Main ----------
 def main():
     init_db()
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        raise RuntimeError("BOT_TOKEN is not set")
-
+        raise RuntimeError("BOT_TOKEN missing")
     app = Application.builder().token(token).build()
-
-    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("gryaz", cmd_gryaz))
     app.add_handler(CommandHandler("stats", cmd_stats))
-
-    # Button votes
     app.add_handler(CallbackQueryHandler(on_vote, pattern=r"^vote:\d+:(plus|minus)$"))
-
-    # Emoji trigger (reply with 🐗 or 💊)
-    app.add_handler(
-        MessageHandler(
-            filters.REPLY & filters.TEXT & filters.Regex(r"(🐗|💊)"),
-            on_emoji_trigger
-        ),
-        group=-1,  # run early
-    )
-
-    # Member tracking & membership updates
+    app.add_handler(MessageHandler(filters.REPLY & filters.TEXT & filters.Regex(r"(🐗|💊)"), on_emoji_trigger))
     app.add_handler(MessageHandler(filters.ALL & (~filters.StatusUpdate.ALL), on_message))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
-
-    log.info(
-        "Starting bot polling… (DB_PATH=%s, VOTE_TIMEOUT=%s, INIT_SCORES=%s)",
-        DB_PATH, VOTE_TIMEOUT, "set" if INIT_SCORES_MAP else "unset"
-    )
+    log.info("Bot started with cooldown=%s timeout=%s", TARGET_COOLDOWN, VOTE_TIMEOUT)
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
