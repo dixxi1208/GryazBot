@@ -28,7 +28,7 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-DB_PATH = "gryaz.db"
+DB_PATH = os.environ.get("DB_PATH", "gryaz.db")
 
 # ---------- DB helpers ----------
 def db():
