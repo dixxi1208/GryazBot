@@ -1,9 +1,11 @@
 # bot.py
 import os
+import re
+import json
 import math
+import time
 import sqlite3
 import logging
-import time
 from contextlib import closing
 from typing import Optional
 
@@ -25,12 +27,74 @@ from telegram.ext import (
     filters,
 )
 
-# ---------- Logging ----------
+# ---------- Config / Logging ----------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "gryaz.db")
-COOLDOWN_SECONDS = 300  # 5 minutes
+COOLDOWN_SECONDS = 300  # 5 minutes between targeting same person in the same chat
+VOTE_TIMEOUT = int(os.environ.get("VOTE_TIMEOUT", "0"))  # 0 = disabled
+
+# INIT_SCORES examples:
+# JSON (recommended):
+#   {"dixxi": 3, "@alice": 5, "Bob": 2}
+# or CSV:
+#   dixxi:3, @alice:5, Bob:2
+INIT_SCORES_RAW = os.environ.get("INIT_SCORES", "").strip()
+
+def parse_init_scores(raw: str):
+    """
+    Parse INIT_SCORES into a dict: key(lowercased 'username' or 'first name') -> int points
+    Supports JSON (object or list of {name|username, points}) or CSV "key:points, key:points"
+    """
+    mapping = {}
+    if not raw:
+        return mapping
+    # Try JSON
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if not isinstance(v, int):
+                    continue
+                key = str(k).lstrip("@").strip().lower()
+                if key:
+                    mapping[key] = v
+            return mapping
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                pts = item.get("points")
+                if not isinstance(pts, int):
+                    continue
+                key = (item.get("username") or item.get("name") or "").lstrip("@").strip().lower()
+                if key:
+                    mapping[key] = pts
+            return mapping
+    except Exception:
+        pass
+    # Fallback CSV
+    try:
+        pairs = [p for p in re.split(r"\s*,\s*", raw) if p]
+        for pair in pairs:
+            if ":" not in pair:
+                continue
+            k, v = pair.split(":", 1)
+            k = k.lstrip("@").strip().lower()
+            try:
+                points = int(v.strip())
+            except Exception:
+                continue
+            if k:
+                mapping[k] = points
+    except Exception:
+        pass
+    return mapping
+
+INIT_SCORES_MAP = parse_init_scores(INIT_SCORES_RAW)
+if INIT_SCORES_MAP:
+    log.info("INIT_SCORES loaded for %d keys", len(INIT_SCORES_MAP))
 
 # ---------- DB helpers ----------
 def db():
@@ -44,11 +108,11 @@ def init_db():
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS members(
-              chat_id   INTEGER NOT NULL,
-              user_id   INTEGER NOT NULL,
-              username  TEXT,
+              chat_id    INTEGER NOT NULL,
+              user_id    INTEGER NOT NULL,
+              username   TEXT,
               first_name TEXT,
-              is_bot    INTEGER NOT NULL DEFAULT 0,
+              is_bot     INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY(chat_id, user_id)
             );
 
@@ -60,20 +124,20 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS polls(
-              id            INTEGER PRIMARY KEY AUTOINCREMENT,
-              chat_id       INTEGER NOT NULL,
-              message_id    INTEGER NOT NULL,
+              id             INTEGER PRIMARY KEY AUTOINCREMENT,
+              chat_id        INTEGER NOT NULL,
+              message_id     INTEGER NOT NULL,
               target_user_id INTEGER NOT NULL,
-              plus_count    INTEGER NOT NULL DEFAULT 0,
-              minus_count   INTEGER NOT NULL DEFAULT 0,
-              closed        INTEGER NOT NULL DEFAULT 0,
-              created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+              plus_count     INTEGER NOT NULL DEFAULT 0,
+              minus_count    INTEGER NOT NULL DEFAULT 0,
+              closed         INTEGER NOT NULL DEFAULT 0,
+              created_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
 
             CREATE TABLE IF NOT EXISTS poll_votes(
-              poll_id        INTEGER NOT NULL,
-              voter_user_id  INTEGER NOT NULL,
-              vote           TEXT NOT NULL CHECK(vote IN ('plus','minus')),
+              poll_id       INTEGER NOT NULL,
+              voter_user_id INTEGER NOT NULL,
+              vote          TEXT NOT NULL CHECK(vote IN ('plus','minus')),
               PRIMARY KEY(poll_id, voter_user_id),
               FOREIGN KEY(poll_id) REFERENCES polls(id) ON DELETE CASCADE
             );
@@ -87,9 +151,9 @@ def upsert_member(chat: Chat, user) -> None:
             INSERT INTO members(chat_id, user_id, username, first_name, is_bot)
             VALUES(?,?,?,?,?)
             ON CONFLICT(chat_id, user_id) DO UPDATE SET
-              username  = excluded.username,
-              first_name= excluded.first_name,
-              is_bot    = excluded.is_bot
+              username   = excluded.username,
+              first_name = excluded.first_name,
+              is_bot     = excluded.is_bot
             """,
             (chat.id, user.id, user.username or "", user.first_name or "", 1 if user.is_bot else 0),
         )
@@ -102,6 +166,36 @@ def non_bot_member_count(chat_id: int) -> int:
         ).fetchone()
         return int(row["c"] or 0)
 
+def maybe_apply_init_score(chat_id: int, user) -> None:
+    """If INIT_SCORES is set and this user's username/first_name matches, set their score (once)."""
+    if not INIT_SCORES_MAP:
+        return
+    uname = (user.username or "").lstrip("@").strip().lower()
+    fname = (user.first_name or "").strip().lower()
+
+    key = uname or fname
+    # Try username first, then first name
+    candidates = [uname, fname] if uname != fname else [key]
+    for cand in candidates:
+        if not cand:
+            continue
+        if cand in INIT_SCORES_MAP:
+            points = INIT_SCORES_MAP[cand]
+            with closing(db()) as conn, conn:
+                # Only set if there is no score row yet, or overwrite unconditionally?
+                # We'll set unconditionally to ensure migration wins.
+                conn.execute(
+                    """
+                    INSERT INTO scores(chat_id, user_id, score)
+                    VALUES(?,?,?)
+                    ON CONFLICT(chat_id, user_id) DO UPDATE SET score=excluded.score
+                    """,
+                    (chat_id, user.id, points),
+                )
+            log.info("Seeded score for user_id=%s in chat_id=%s to %s via INIT_SCORES key=%s",
+                     user.id, chat_id, points, cand)
+            break
+
 # ---------- Utils ----------
 async def ensure_group(update: Update) -> Optional[Chat]:
     if not update.effective_chat or update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -113,10 +207,8 @@ async def ensure_group(update: Update) -> Optional[Chat]:
 def resolve_target_user(update: Update):
     """Return a telegram.User (via reply) or an int user_id (from cached @username); else None."""
     msg = update.effective_message
-    # Prefer reply target
     if msg and msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user
-    # Else parse @mention and map via local DB cache
     if msg and msg.entities:
         for ent in msg.entities:
             if ent.type == MessageEntity.MENTION:
@@ -137,10 +229,12 @@ def format_time_left(seconds: int) -> str:
 # ---------- Shared: start a vote for a specific target ----------
 async def start_vote_for_target(update: Update, context, chat: Chat, target_user):
     """Starts a gryaz vote for target_user. Enforces cooldown and avoids duplicates."""
-    # Track issuer & target
+    # Track issuer & target, and maybe seed score
     if update.effective_user:
         upsert_member(chat, update.effective_user)
+        maybe_apply_init_score(chat.id, update.effective_user)
     upsert_member(chat, target_user)
+    maybe_apply_init_score(chat.id, target_user)
 
     now = int(time.time())
 
@@ -200,11 +294,11 @@ async def cmd_start(update: Update, _):
     text = (
         "Hi! I’m a *gryaz* counter.\n\n"
         "• Reply to someone with /gryaz (or reply with 🐗/💊) to start a vote (+ / –)\n"
-        "• When + votes reach half of non-bot members, the target gets +1\n"
-        "• If – votes reach half, the poll is cancelled\n"
-        "• Each user can vote only once per poll\n"
-        "• A person cannot be targeted again until 5 minutes have passed\n"
-        "• /stats — show scores\n\n"
+        "• + votes ≥ half of non-bot members → +1 to target\n"
+        "• – votes ≥ half → poll cancelled\n"
+        f"• Each user can vote only once per poll; target cooldown: {COOLDOWN_SECONDS//60} min\n"
+        f"• Vote timeout: {'off' if VOTE_TIMEOUT <= 0 else str(VOTE_TIMEOUT//60)+' min'}\n"
+        "• /stats — show scores (leaders get 💊)\n\n"
         "_Tip: Disable privacy mode in BotFather and make me admin for best results._"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -303,6 +397,7 @@ async def on_vote(update: Update, context):
     chat = q.message.chat
     voter = q.from_user
     upsert_member(chat, voter)
+    maybe_apply_init_score(chat.id, voter)
 
     with closing(db()) as conn:
         poll = conn.execute(
@@ -311,6 +406,17 @@ async def on_vote(update: Update, context):
 
     if not poll or poll["closed"]:
         await q.edit_message_reply_markup(reply_markup=None)
+        return
+
+    # Timeout check
+    now = int(time.time())
+    if VOTE_TIMEOUT > 0 and now - int(poll["created_at"]) >= VOTE_TIMEOUT:
+        with closing(db()) as conn, conn:
+            conn.execute("UPDATE polls SET closed=1 WHERE id=?", (poll_id,))
+        await q.edit_message_text(
+            f"⌛ *Vote expired* (no decision in {VOTE_TIMEOUT//60} minutes).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     # One vote only
@@ -392,20 +498,23 @@ async def on_vote(update: Update, context):
         )
 
 async def on_message(update: Update, _):
-    """Track active chat members from any non-status message."""
+    """Track active chat members from any non-status message and apply seeding if configured."""
     if not update.effective_chat or update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
     if update.effective_user:
         upsert_member(update.effective_chat, update.effective_user)
+        maybe_apply_init_score(update.effective_chat.id, update.effective_user)
     if update.effective_message and update.effective_message.reply_to_message and update.effective_message.reply_to_message.from_user:
         upsert_member(update.effective_chat, update.effective_message.reply_to_message.from_user)
+        maybe_apply_init_score(update.effective_chat.id, update.effective_message.reply_to_message.from_user)
 
 async def on_chat_member(update: Update, _):
-    """Track joins/leaves via chat member updates."""
+    """Track joins/leaves via chat member updates and apply seeding if configured."""
     cmu: ChatMemberUpdated = update.chat_member
     chat = cmu.chat
     user = cmu.new_chat_member.user
     upsert_member(chat, user)
+    maybe_apply_init_score(chat.id, user)
 
 # ---------- Main ----------
 def main():
@@ -437,7 +546,10 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & (~filters.StatusUpdate.ALL), on_message))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
-    log.info("Starting bot polling…")
+    log.info(
+        "Starting bot polling… (DB_PATH=%s, VOTE_TIMEOUT=%s, INIT_SCORES=%s)",
+        DB_PATH, VOTE_TIMEOUT, "set" if INIT_SCORES_MAP else "unset"
+    )
     app.run_polling()
 
 if __name__ == "__main__":
